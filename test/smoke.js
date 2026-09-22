@@ -164,7 +164,7 @@ async function startServer(port) {
   serverLog = '';
   const child = spawn(process.execPath, [SERVER_PATH], {
     cwd: ROOT,
-    env: { ...process.env, PORT: String(port) },
+    env: { ...process.env, PORT: String(port), RESUME_GRACE_MS: '1200' },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   serverChild = child;
@@ -236,6 +236,13 @@ async function connectClient(port, label) {
   return { c: client, welcome, label };
 }
 
+async function connectWithResume(port, label, code, resumeToken, name) {
+  const resumed = await connectClient(port, label);
+  resumed.c.send({ type: 'join_room', code, name, resumeToken });
+  const room = await resumed.c.waitFor((m) => m.type === 'room_update', '恢复后的 room_update');
+  return { ...resumed, room };
+}
+
 /** 期望收到一条包含 substr 的 error */
 async function expectError(client, substr, label) {
   const msg = await client.waitFor(
@@ -270,16 +277,17 @@ async function main() {
     // ================= 1. 房间与人数上限 =================
     section('【1】房间：4 位房间号 / 2 人上限 / 第三人被拒');
 
-    const a = await connectClient(port, '玩家A');
+    let a = await connectClient(port, '玩家A');
     clients.push(a.c);
     check(Number.isInteger(a.welcome.playerId), '连接后收到 welcome 并分配 playerId');
+    check(typeof a.welcome.sessionToken === 'string' && a.welcome.sessionToken.length >= 40, 'welcome 只给当前连接一个不可猜测的恢复凭证');
 
     a.c.send({ type: 'create_room', name: '甲' });
     const roomA = await a.c.waitFor((m) => m.type === 'room_update', 'room_update（创建房间）');
     check(/^\d{4}$/.test(String(roomA.code)), `创建房间返回 4 位数字房间号（${roomA.code}）`);
     check(roomA.players.length === 1 && roomA.game === null, '创建后房间里只有 1 人，且还没选游戏');
 
-    const b = await connectClient(port, '玩家B');
+    let b = await connectClient(port, '玩家B');
     clients.push(b.c);
     b.c.send({ type: 'join_room', code: roomA.code, name: '乙' });
     const roomB = await b.c.waitFor((m) => m.type === 'room_update', 'room_update（加入房间）');
@@ -306,6 +314,15 @@ async function main() {
 
     c3.c.send({ type: 'join_room', code: '0000', name: '丙' });
     await expectError(c3.c, '不存在', '加入不存在的房间号被拒绝');
+    c3.c.send({ type: 'join_room', code: roomA.code, name: '丙', resumeToken: 'invalid-resume-token' });
+    const invalidResume = await expectError(c3.c, '恢复凭证无效', '错误恢复凭证被拒绝');
+    check(invalidResume.code === 'resume_invalid', '错误恢复凭证带有明确的 resume_invalid 错误码');
+    check(!c3.c.types().includes('room_update'), '错误恢复凭证没有进入房间');
+    c3.c.send({ type: 'create_room', name: '丙' });
+    await c3.c.waitFor((m) => m.type === 'room_update' && m.players.length === 1, '主动退出测试房间');
+    c3.c.send({ type: 'leave_room' });
+    await c3.c.waitFor((m) => m.type === 'room_left', '主动退出确认');
+    check(true, '主动退出收到 room_left 确认，客户端可清理本地恢复信息');
 
     // ================= 2. 五子棋 =================
     section('【2】五子棋：落子、轮次、胜负全部服务端权威');
@@ -322,8 +339,9 @@ async function main() {
     check(gA.turn === 1 && gB.turn === 1, '开局 turn=1（黑先），双方一致');
     check(gA.winner === null && gA.moveCount === 0, '开局无胜者、落子数为 0');
 
-    const black = gA.youColor === 1 ? a : b;
-    const white = black === a ? b : a;
+    let black = gA.youColor === 1 ? a : b;
+    let white = black === a ? b : a;
+    const blackIsA = black === a;
     note(`随机分配：${black.label} 执黑先手，${white.label} 执白`);
 
     white.c.send({ type: 'gomoku_move', x: 7, y: 7 });
@@ -340,6 +358,60 @@ async function main() {
     check(m1.turn === 2 && m1Other.turn === 2, '落子后轮次切到白方，双方一致');
     check(JSON.stringify(m1.board) === JSON.stringify(m1Other.board), '两个客户端收到的棋盘完全相同');
     check(m1.moveCount === 1, '服务端落子计数为 1');
+
+    // ================= 2.1 五子棋断线恢复 =================
+    section('【2.1】五子棋：临时断线暂停、凭证恢复、旧 close 不破坏状态');
+    const stableAToken = a.welcome.sessionToken;
+    const stableBToken = b.welcome.sessionToken;
+    const aTakeover = await connectWithResume(port, '玩家A-接管', roomA.code, stableAToken, '甲');
+    clients.push(aTakeover.c);
+    const takeoverState = await aTakeover.c.waitFor((m) => m.type === 'gomoku_state', '接管后的 gomoku_state');
+    check(aTakeover.room.resumed === true && aTakeover.room.players.length === 2, '同一恢复凭证接管连接时不新增席位');
+    check(
+      takeoverState.moveCount === 1 && takeoverState.board[7 * 15 + 7] === 1 &&
+        takeoverState.youColor === gA.youColor,
+      '接管后棋盘、落子数和原玩家颜色完全保留',
+    );
+    const peerEventsBeforeOldClose = b.c.messages.filter((m) => m.type === 'peer_left').length;
+    a.c.destroy();
+    await sleep(200);
+    check(
+      b.c.messages.filter((m) => m.type === 'peer_left').length === peerEventsBeforeOldClose,
+      '旧连接延迟 close 不会清掉已接管的新连接席位',
+    );
+    a = aTakeover;
+
+    a.c.destroy();
+    const pausedNotice = await b.c.waitFor(
+      (m) => m.type === 'peer_left' && m.temporary === true,
+      '临时断线通知',
+    );
+    const pausedGame = await b.c.waitFor(
+      (m) => m.type === 'gomoku_state' && m.paused === true,
+      '断线暂停后的 gomoku_state',
+    );
+    check(pausedNotice.reconnectUntil > Date.now(), '临时断线通知包含未来的恢复截止时间');
+    check(
+      pausedGame.moveCount === 1 && pausedGame.board[7 * 15 + 7] === 1,
+      '对方离线期间棋盘和轮次仍保留，且状态进入暂停',
+    );
+    c3.c.send({ type: 'join_room', code: roomA.code, name: '丙' });
+    await expectError(c3.c, '已满', '对方断线保留席位时第三人仍被拒绝');
+
+    const aBack = await connectWithResume(port, '玩家A-恢复', roomA.code, stableAToken, '甲');
+    clients.push(aBack.c);
+    const recoveredGame = await aBack.c.waitFor(
+      (m) => m.type === 'gomoku_state' && m.paused === false && m.moveCount === 1,
+      '恢复后的 gomoku_state',
+    );
+    check(
+      recoveredGame.board[7 * 15 + 7] === 1 && recoveredGame.youColor === gA.youColor &&
+        recoveredGame.turn === m1.turn,
+      '恢复后完整同步原棋盘、身份和轮次',
+    );
+    a = aBack;
+    black = blackIsA ? a : b;
+    white = black === a ? b : a;
 
     black.c.send({ type: 'gomoku_move', x: 8, y: 8 });
     await expectError(black.c, '轮到', '黑方连下第二手被拒绝（轮次由服务端把控）');
@@ -457,6 +529,23 @@ async function main() {
       '猜题者提问被广播给双方，且还未回答',
     );
 
+    const bTakeover = await connectWithResume(port, '玩家B-接管', roomA.code, stableBToken, '乙');
+    clients.push(bTakeover.c);
+    const soupRecovered = await bTakeover.c.waitFor(
+      (m) => m.type === 'soup_state' && m.lastQuestion && m.lastQuestion.text === qText,
+      '海龟汤提问阶段恢复',
+    );
+    check(
+      soupRecovered.isHost === false && soupRecovered.lastQuestion.answer === null &&
+        soupRecovered.answer === null,
+      '海龟汤恢复保留待回答问题，猜题者仍拿不到汤底',
+    );
+    b.c.destroy();
+    await sleep(200);
+    b = bTakeover;
+    black = blackIsA ? a : b;
+    white = black === a ? b : a;
+
     a.c.send({ type: 'soup_answer', answer: 'maybe' });
     await expectError(a.c, '非法回答', '非法的回答枚举值被拒绝');
 
@@ -513,6 +602,26 @@ async function main() {
       !a.c.rawTexts.some((t) => t.includes(newAnswer)),
       '原汤主（现猜题者）的全部原始消息中不含新汤底',
     );
+
+    // ================= 5.1 恢复期限回收 =================
+    section('【5.1】双方同时断线：宽限期到期后回收房间');
+    const d = await connectClient(port, '玩家D');
+    const e = await connectClient(port, '玩家E');
+    clients.push(d.c, e.c);
+    d.c.send({ type: 'create_room', name: '丁' });
+    const roomD = await d.c.waitFor((m) => m.type === 'room_update', '创建短期测试房间');
+    e.c.send({ type: 'join_room', code: roomD.code, name: '戊' });
+    await e.c.waitFor((m) => m.type === 'room_update', '加入短期测试房间');
+    d.c.send({ type: 'select_game', game: 'gomoku' });
+    await d.c.waitFor((m) => m.type === 'gomoku_state', '短期测试房间开局');
+    await e.c.waitFor((m) => m.type === 'gomoku_state', '短期测试房间对方开局');
+    d.c.destroy();
+    e.c.destroy();
+    await sleep(1700);
+    const f = await connectClient(port, '玩家F');
+    clients.push(f.c);
+    f.c.send({ type: 'join_room', code: roomD.code, name: '己' });
+    await expectError(f.c, '不存在', '双方超过恢复期限后房间被回收');
 
     // ================= 6. HTTP 静态服务 =================
     section('【6】HTTP：静态资源与 /api/info');

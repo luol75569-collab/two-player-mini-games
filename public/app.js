@@ -31,6 +31,7 @@
     ws: null,
     playerId: null,
     roomCode: localStorage.getItem('gh_room') || '',
+    resumeToken: localStorage.getItem('gh_resume') || '',
     name: localStorage.getItem('gh_name') || '',
     players: [],
     game: null,
@@ -39,12 +40,67 @@
     answerVisible: false,
     reconnectTimer: null,
     reconnectDelay: 1000,
+    connectTimer: null,
+    heartbeatTimer: null,
+    lastPongAt: 0,
+    connectionState: 'idle', // connecting | restoring | ready | failed
+    latestSessionToken: '',
+    offlineUntil: null,
+    offlineTimer: null,
   };
 
   $('nameInput').value = state.name;
   if (state.roomCode) $('joinCodeInput').value = state.roomCode;
 
   // ---------- WebSocket ----------
+  function setConnBar(text, visible = true) {
+    const el = $('connBar');
+    el.textContent = text;
+    el.classList.toggle('hidden', !visible);
+  }
+
+  function remainingText(until) {
+    if (!until) return '';
+    const seconds = Math.max(0, Math.ceil((until - Date.now()) / 1000));
+    return seconds > 60 ? `${Math.ceil(seconds / 60)} 分钟` : `${seconds} 秒`;
+  }
+
+  function renderConnectionNotice() {
+    clearTimeout(state.offlineTimer);
+    if (state.offlineUntil && state.offlineUntil > Date.now()) {
+      setConnBar(`对方暂时离线，当前对局保留 ${remainingText(state.offlineUntil)}，正在等待恢复…`);
+      state.offlineTimer = setTimeout(renderConnectionNotice, 1000);
+      return;
+    }
+    if (state.offlineUntil) {
+      state.offlineUntil = null;
+      setConnBar('恢复期限已到，请重新创建或加入房间。');
+      return;
+    }
+    if (state.connectionState === 'connecting') setConnBar('正在连接…');
+    else if (state.connectionState === 'restoring') setConnBar('正在恢复房间和对局…');
+    else if (state.connectionState === 'failed') setConnBar('恢复失败，请重新创建或加入房间。');
+    else if (state.connectionState === 'ready') setConnBar('', false);
+  }
+
+  function stopHeartbeat() {
+    clearInterval(state.heartbeatTimer);
+    state.heartbeatTimer = null;
+  }
+
+  function startHeartbeat(ws) {
+    stopHeartbeat();
+    state.lastPongAt = Date.now();
+    state.heartbeatTimer = setInterval(() => {
+      if (state.ws !== ws || ws.readyState !== WebSocket.OPEN) return;
+      if (Date.now() - state.lastPongAt > 32000) {
+        try { ws.close(4001, 'heartbeat timeout'); } catch (_) { /* ignore */ }
+        return;
+      }
+      try { ws.send(JSON.stringify({ type: 'ping' })); } catch (_) { /* onclose 会处理 */ }
+    }, 15000);
+  }
+
   function wsUrl() {
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     return `${proto}//${location.host}/ws`;
@@ -52,26 +108,52 @@
 
   function connect() {
     if (state.ws && (state.ws.readyState === 0 || state.ws.readyState === 1)) return;
+    clearTimeout(state.reconnectTimer);
+    state.reconnectTimer = null;
+    state.connectionState = state.roomCode ? 'restoring' : 'connecting';
+    renderConnectionNotice();
     const ws = new WebSocket(wsUrl());
     state.ws = ws;
+    state.connectTimer = setTimeout(() => {
+      if (state.ws === ws && ws.readyState === WebSocket.CONNECTING) {
+        try { ws.close(4000, 'connect timeout'); } catch (_) { /* ignore */ }
+      }
+    }, 8000);
 
     ws.onopen = () => {
-      $('connBar').classList.add('hidden');
+      if (state.ws !== ws) return;
+      clearTimeout(state.connectTimer);
+      state.connectTimer = null;
       state.reconnectDelay = 1000;
-      // 断线重连后自动回到房间
+      state.connectionState = state.roomCode ? 'restoring' : 'ready';
+      renderConnectionNotice();
+      startHeartbeat(ws);
+      // 只有收到 room_update / 游戏状态后，才会被视为已恢复。
       if (state.roomCode) {
-        send({ type: 'join_room', code: state.roomCode, name: state.name });
+        sendOnSocket(ws, {
+          type: 'join_room',
+          code: state.roomCode,
+          name: state.name,
+          ...(state.resumeToken ? { resumeToken: state.resumeToken } : {}),
+        });
       }
     };
 
     ws.onmessage = (ev) => {
+      if (state.ws !== ws) return;
       let msg;
       try { msg = JSON.parse(ev.data); } catch (_) { return; }
       handleServer(msg);
     };
 
     ws.onclose = () => {
-      $('connBar').classList.remove('hidden');
+      if (state.ws !== ws) return;
+      clearTimeout(state.connectTimer);
+      state.connectTimer = null;
+      state.ws = null;
+      stopHeartbeat();
+      state.connectionState = 'connecting';
+      setConnBar(state.roomCode ? '连接已断开，正在恢复房间…' : '连接已断开，正在重连…');
       scheduleReconnect();
     };
 
@@ -80,15 +162,23 @@
 
   function scheduleReconnect() {
     clearTimeout(state.reconnectTimer);
+    const jitter = Math.floor(Math.random() * 500);
     state.reconnectTimer = setTimeout(() => {
+      state.reconnectTimer = null;
       state.reconnectDelay = Math.min(state.reconnectDelay * 2, 10000);
       connect();
-    }, state.reconnectDelay);
+    }, state.reconnectDelay + jitter);
+  }
+
+  function sendOnSocket(ws, obj) {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      try { ws.send(JSON.stringify(obj)); return true; } catch (_) { /* onclose 会处理 */ }
+    }
+    return false;
   }
 
   function send(obj) {
-    if (state.ws && state.ws.readyState === 1) {
-      state.ws.send(JSON.stringify(obj));
+    if (sendOnSocket(state.ws, obj)) {
       return true;
     }
     toast('连接已断开，正在重连…');
@@ -101,8 +191,26 @@
     switch (msg.type) {
       case 'welcome':
         state.playerId = msg.playerId;
+        state.latestSessionToken = msg.sessionToken || '';
+        if (!state.resumeToken && msg.sessionToken) {
+          state.resumeToken = msg.sessionToken;
+          localStorage.setItem('gh_resume', msg.sessionToken);
+        }
         break;
       case 'error':
+        if (msg.code === 'resume_invalid') {
+          state.resumeToken = state.latestSessionToken;
+          state.roomCode = '';
+          state.game = null;
+          state.gomoku = null;
+          state.soup = null;
+          if (state.resumeToken) localStorage.setItem('gh_resume', state.resumeToken);
+          else localStorage.removeItem('gh_resume');
+          localStorage.removeItem('gh_room');
+          state.connectionState = 'failed';
+          renderConnectionNotice();
+          showPage('lobby');
+        }
         if (!$('lobby').classList.contains('hidden')) {
           $('lobbyError').textContent = msg.message || '出错了';
         } else {
@@ -113,7 +221,25 @@
         onRoomUpdate(msg);
         break;
       case 'peer_left':
-        toast(msg.message || '对方离开了房间');
+        if (msg.temporary) {
+          state.offlineUntil = msg.reconnectUntil || null;
+          renderConnectionNotice();
+          toast(msg.message || '对方暂时断开，正在等待恢复');
+        } else {
+          state.offlineUntil = null;
+          state.game = null;
+          state.gomoku = null;
+          state.soup = null;
+          state.connectionState = 'ready';
+          renderConnectionNotice();
+          showPage('room');
+          toast(msg.message || '对方离开了房间');
+        }
+        break;
+      case 'room_left':
+        break;
+      case 'pong':
+        state.lastPongAt = Date.now();
         break;
       case 'gomoku_state':
         state.gomoku = msg;
@@ -127,18 +253,20 @@
         renderSoup();
         showPage('soup');
         break;
-      case 'pong':
-        break;
       default:
         break;
     }
   }
 
   function onRoomUpdate(msg) {
+    state.connectionState = 'ready';
+    state.playerId = msg.you || state.playerId;
     state.roomCode = msg.code;
     state.players = msg.players;
     state.game = msg.game;
     localStorage.setItem('gh_room', msg.code);
+    state.offlineUntil = msg.paused ? msg.resumeUntil : null;
+    renderConnectionNotice();
 
     $('roomCode').textContent = msg.code;
     renderPlayerList(msg.players);
@@ -160,7 +288,7 @@
     for (const p of players) {
       const chip = document.createElement('span');
       chip.className = 'player-chip' + (p.id === state.playerId ? ' me' : '');
-      chip.textContent = (p.id === state.playerId ? '我 · ' : '') + (p.name || `玩家${p.id}`);
+      chip.textContent = (p.id === state.playerId ? '我 · ' : '') + (p.name || `玩家${p.id}`) + (p.online === false ? '（离线）' : '');
       box.appendChild(chip);
     }
   }
@@ -213,7 +341,10 @@
   $('leaveRoomBtn').addEventListener('click', () => {
     send({ type: 'leave_room' });
     state.roomCode = '';
+    state.resumeToken = '';
+    state.offlineUntil = null;
     localStorage.removeItem('gh_room');
+    localStorage.removeItem('gh_resume');
     state.gomoku = null;
     state.soup = null;
     showPage('lobby');
@@ -360,7 +491,9 @@
       return p ? p.name : (color === 1 ? '黑方' : '白方');
     };
 
-    if (g.winner === 'draw') {
+    if (g.paused) {
+      statusEl.textContent = `对方暂时离线，当前对局已暂停（保留 ${remainingText(g.resumeUntil)}）`;
+    } else if (g.winner === 'draw') {
       statusEl.innerHTML = '<span class="win">平局！棋盘已满</span>';
     } else if (g.winner) {
       const winName = nameOf(g.winner);
@@ -377,12 +510,14 @@
       const span = document.createElement('span');
       const dot = `<span class="stone-dot ${p.color === 1 ? 'stone-black' : 'stone-white'}"></span>`;
       const me = p.id === state.playerId ? '（我）' : '';
-      const turnFlag = (!g.winner && g.turn === p.color) ? ' <span class="turn-flag">● 行棋中</span>' : '';
-      span.innerHTML = `${dot}${escapeHtml(p.name)}${me}${turnFlag}`;
+      const offline = p.online === false ? ' <span class="muted">（离线）</span>' : '';
+      const turnFlag = (!g.paused && !g.winner && g.turn === p.color) ? ' <span class="turn-flag">● 行棋中</span>' : '';
+      span.innerHTML = `${dot}${escapeHtml(p.name)}${me}${offline}${turnFlag}`;
       playersEl.appendChild(span);
     }
 
     drawBoard();
+    $('gomokuRestart').disabled = !!g.paused;
   }
 
   $('gomokuRestart').addEventListener('click', () => send({ type: 'restart' }));
@@ -401,6 +536,7 @@
   function renderSoup() {
     const s = state.soup;
     if (!s) return;
+    const paused = !!s.paused;
 
     $('soupTitle').textContent = s.title || '海龟汤';
     $('soupSurface').textContent = s.surface || '';
@@ -434,15 +570,21 @@
 
       // 待回答问题
       const pendingQ = s.lastQuestion && !s.lastQuestion.answer;
-      $('hostPending').textContent = pendingQ
+      $('hostPending').textContent = paused
+        ? `对方暂时离线，当前汤暂停（保留 ${remainingText(s.resumeUntil)}）`
+        : pendingQ
         ? `猜题者问：「${s.lastQuestion.text}」—— 请回答：`
         : (s.phase === 'playing' ? '等待猜题者提问…' : '');
-      document.querySelectorAll('.btn-answer').forEach((b) => { b.disabled = !pendingQ; });
+      document.querySelectorAll('.btn-answer').forEach((b) => { b.disabled = paused || !pendingQ; });
 
       // 待判定最终推理
       const pendingGuess = s.lastGuess && !s.lastGuess.verdict;
       $('verdictBox').classList.toggle('hidden', !pendingGuess);
     }
+
+    ['hostReveal', 'hostNewSoup', 'verdictPass', 'verdictFail', 'askBtn', 'finalGuessBtn', 'giveUpBtn', 'swapBtn']
+      .forEach((id) => { if ($(id)) $(id).disabled = paused; });
+    $('questionInput').disabled = paused;
 
     renderChat(s.log || []);
   }
@@ -533,6 +675,31 @@
   $('soupBack2').addEventListener('click', () => {
     send({ type: 'select_game', game: null });
     showPage('room');
+  });
+
+  function syncRoom() {
+    if (!state.roomCode) {
+      if (!state.ws || state.ws.readyState !== WebSocket.OPEN) connect();
+      return;
+    }
+    if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+      state.connectionState = 'restoring';
+      renderConnectionNotice();
+      sendOnSocket(state.ws, {
+        type: 'join_room',
+        code: state.roomCode,
+        name: state.name,
+        ...(state.resumeToken ? { resumeToken: state.resumeToken } : {}),
+      });
+    } else {
+      connect();
+    }
+  }
+
+  window.addEventListener('online', syncRoom);
+  window.addEventListener('pageshow', syncRoom);
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') syncRoom();
   });
 
   // ---------- 启动 ----------

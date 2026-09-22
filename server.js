@@ -11,11 +11,14 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const crypto = require('crypto');
 const { WebSocketServer } = require('ws');
 
 const PORT = Number(process.env.PORT) || 3000;
 const HOST = '0.0.0.0';
 const PUBLIC_DIR = path.join(__dirname, 'public');
+const RESUME_GRACE_MS = Math.max(1000, Number(process.env.RESUME_GRACE_MS) || 5 * 60 * 1000);
+const INSTANCE_ID = crypto.randomBytes(6).toString('hex');
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -41,12 +44,13 @@ try {
 // ---------- 内存房间 ----------
 /** @type {Map<string, Room>} */
 const rooms = new Map();
+const sessions = new Map();
 let nextPlayerId = 1;
 
 /**
  * Room 结构:
  * {
- *   code, players: Map<playerId, {id, name, ws, alive}>,
+ *   code, players: Map<playerId, {id, name, ws, roomCode, online, sessionToken, disconnectTimer, reconnectUntil}>,
  *   game: null | 'soup' | 'gomoku',
  *   gomoku: { board: Int8Array(225), turn: 1|2, colors: {playerId:1|2}, winner: null|1|2|'draw', winningLine: [[x,y]...]|null } | null,
  *   soup: { soupIndex, hostId, guesserId, phase: 'idle'|'playing'|'answering'|'guessing'|'revealed', log: [], lastQuestion, lastGuess } | null
@@ -80,11 +84,77 @@ function broadcast(room, obj, exceptId) {
 }
 
 function roomPlayers(room) {
-  return [...room.players.values()].map(p => ({ id: p.id, name: p.name }));
+  return [...room.players.values()].map(p => ({
+    id: p.id,
+    name: p.name,
+    online: p.online,
+    reconnectUntil: p.online ? null : p.reconnectUntil,
+  }));
 }
 
-function sendError(ws, message) {
-  safeSend(ws, { type: 'error', message });
+function roomAvailability(room) {
+  const offlinePlayers = [...room.players.values()]
+    .filter(p => !p.online)
+    .map(p => ({ id: p.id, name: p.name, reconnectUntil: p.reconnectUntil }));
+  return {
+    paused: offlinePlayers.length > 0,
+    offlinePlayers,
+    offlinePlayer: offlinePlayers[0] || null,
+    resumeUntil: offlinePlayers.reduce((min, p) => Math.min(min, p.reconnectUntil || min), Infinity),
+  };
+}
+
+function roomReady(room) {
+  return room.players.size === 2 && [...room.players.values()].every(p => p.online);
+}
+
+function sendError(ws, message, code) {
+  safeSend(ws, { type: 'error', message, ...(code ? { code } : {}) });
+}
+
+function newSession(ws) {
+  const sessionToken = crypto.randomBytes(32).toString('base64url');
+  const player = {
+    id: nextPlayerId++,
+    name: '',
+    ws,
+    roomCode: null,
+    online: true,
+    sessionToken,
+    connectedAt: Date.now(),
+    disconnectTimer: null,
+    reconnectUntil: null,
+  };
+  sessions.set(sessionToken, player);
+  return player;
+}
+
+function clearDisconnectTimer(player) {
+  if (player.disconnectTimer) {
+    clearTimeout(player.disconnectTimer);
+    player.disconnectTimer = null;
+  }
+}
+
+function roomStatusFor(room) {
+  const status = roomAvailability(room);
+  return {
+    paused: status.paused,
+    offlinePlayer: status.offlinePlayer,
+    resumeUntil: Number.isFinite(status.resumeUntil) ? status.resumeUntil : null,
+  };
+}
+
+function requireReady(room, ws) {
+  if (room.players.size < 2) {
+    sendError(ws, '等待第二位玩家加入后才能继续。', 'room_not_ready');
+    return false;
+  }
+  if (!roomReady(room)) {
+    sendError(ws, '对方暂时离线，正在保留当前对局，请等待恢复。', 'room_paused');
+    return false;
+  }
+  return true;
 }
 
 // ---------- 五子棋（服务端权威） ----------
@@ -118,6 +188,7 @@ function gomokuStateFor(room, viewerId) {
     winner: g.winner,
     winningLine: g.winningLine,
     moveCount: g.moveCount,
+    ...roomStatusFor(room),
     players: players.map(p => ({ ...p, color: colorOf[p.id] || null })),
     youColor: colorOf[viewerId] || null,
   };
@@ -223,6 +294,7 @@ function soupPublicState(room, viewerId) {
     players,
     lastQuestion: s.lastQuestion,
     lastGuess: s.lastGuess,
+    ...roomStatusFor(room),
   };
   // 关键：汤底与提示只发给汤主，或揭晓后才发给所有人
   if (isHost || s.phase === 'revealed') {
@@ -247,18 +319,21 @@ function soupLog(room, entry) {
 }
 
 // ---------- 房间通用状态 ----------
-function roomUpdateFor(room, viewerId) {
+function roomUpdateFor(room, viewerId, extra) {
   return {
     type: 'room_update',
     code: room.code,
     players: roomPlayers(room),
     game: room.game,
     you: viewerId,
+    ...roomStatusFor(room),
+    ...(extra || {}),
   };
 }
 
-function broadcastRoomUpdate(room) {
+function broadcastRoomUpdate(room, exceptId) {
   for (const p of room.players.values()) {
+    if (p.id === exceptId) continue;
     safeSend(p.ws, roomUpdateFor(room, p.id));
   }
 }
@@ -276,26 +351,102 @@ function getRoomOf(player) {
   return rooms.get(player.roomCode) || null;
 }
 
-function leaveRoom(player, reason) {
-  const room = getRoomOf(player);
-  if (!room) { player.roomCode = null; return; }
+function resetRoomGame(room) {
+  room.game = null;
+  room.gomoku = null;
+  room.soup = null;
+}
+
+function expireDisconnectedPlayer(room, player) {
+  if (rooms.get(room.code) !== room || room.players.get(player.id) !== player || player.online) return;
+  player.disconnectTimer = null;
   room.players.delete(player.id);
   player.roomCode = null;
+  player.reconnectUntil = null;
+  sessions.delete(player.sessionToken);
+  console.log(`[game-hub] reconnect_expired player=${player.id} room=${room.code}`);
+
   if (room.players.size === 0) {
     rooms.delete(room.code);
     return;
   }
   const remaining = [...room.players.values()][0];
-  safeSend(remaining.ws, { type: 'peer_left', message: reason || '对方离开了房间。' });
-  // 游戏依赖两人：重置为大厅
-  room.game = null;
-  room.gomoku = null;
-  room.soup = null;
+  safeSend(remaining.ws, {
+    type: 'peer_left',
+    message: '对方的恢复期限已到，房间已回到大厅。',
+    temporary: false,
+    playerId: player.id,
+  });
+  resetRoomGame(room);
   broadcastRoomUpdate(room);
 }
 
+function reserveDisconnectedPlayer(player, reason) {
+  const room = getRoomOf(player);
+  if (!room || !player.online) return;
+  player.online = false;
+  player.ws = null;
+  player.reconnectUntil = Date.now() + RESUME_GRACE_MS;
+  clearDisconnectTimer(player);
+  player.disconnectTimer = setTimeout(() => expireDisconnectedPlayer(room, player), RESUME_GRACE_MS);
+  console.log(`[game-hub] reconnect_reserved player=${player.id} room=${room.code} graceMs=${RESUME_GRACE_MS}`);
+  for (const p of room.players.values()) {
+    if (p.id === player.id) continue;
+    safeSend(p.ws, {
+      type: 'peer_left',
+      message: reason || '对方暂时断开，正在保留当前对局。',
+      temporary: true,
+      playerId: player.id,
+      reconnectUntil: player.reconnectUntil,
+    });
+  }
+  broadcastRoomUpdate(room);
+  broadcastGameState(room);
+}
+
+function leaveRoom(player, reason, permanent = true) {
+  const room = getRoomOf(player);
+  if (!room) { player.roomCode = null; return; }
+
+  if (!permanent) {
+    reserveDisconnectedPlayer(player, reason);
+    return;
+  }
+
+  clearDisconnectTimer(player);
+  room.players.delete(player.id);
+  player.roomCode = null;
+  player.reconnectUntil = null;
+  if (room.players.size === 0) {
+    rooms.delete(room.code);
+    return;
+  }
+  const remaining = [...room.players.values()][0];
+  safeSend(remaining.ws, {
+    type: 'peer_left',
+    message: reason || '对方离开了房间。',
+    temporary: false,
+    playerId: player.id,
+  });
+  resetRoomGame(room);
+  broadcastRoomUpdate(room);
+}
+
+function attachSession(connection, session, ws) {
+  if (connection.session && connection.session !== session) {
+    sessions.delete(connection.session.sessionToken);
+  }
+  clearDisconnectTimer(session);
+  session.ws = ws;
+  session.online = true;
+  session.reconnectUntil = null;
+  session.connectedAt = Date.now();
+  connection.session = session;
+}
+
 // ---------- 消息处理 ----------
-function handleMessage(ws, player, raw) {
+function handleMessage(ws, connection, raw) {
+  let player = connection.session;
   let msg;
   try {
     msg = JSON.parse(raw);
@@ -329,14 +480,27 @@ function handleMessage(ws, player, raw) {
       const code = String(msg.code || '').trim();
       const room = rooms.get(code);
       if (!room) return sendError(ws, '房间不存在，请核对 4 位房间号。');
+      let resumed = false;
+      const resumeToken = typeof msg.resumeToken === 'string' ? msg.resumeToken : '';
+      if (resumeToken) {
+        const candidate = sessions.get(resumeToken);
+        if (!candidate || candidate.roomCode !== code) {
+          return sendError(ws, '恢复凭证无效或不属于此房间，请重新创建或输入房间号。', 'resume_invalid');
+        }
+        attachSession(connection, candidate, ws);
+        player = connection.session;
+        resumed = true;
+      }
       if (room.players.size >= 2 && !room.players.has(player.id)) {
         return sendError(ws, '房间已满（最多 2 人）。');
       }
       if (player.roomCode && player.roomCode !== code) leaveRoom(player);
-      player.name = sanitizeName(msg.name) || `玩家${player.id}`;
+      const requestedName = sanitizeName(msg.name);
+      if (!resumed || !player.name) player.name = requestedName || `玩家${player.id}`;
       room.players.set(player.id, player);
       player.roomCode = code;
-      broadcastRoomUpdate(room);
+      safeSend(ws, roomUpdateFor(room, player.id, resumed ? { resumed: true } : undefined));
+      broadcastRoomUpdate(room, player.id);
       broadcastGameState(room);
       break;
     }
@@ -344,7 +508,7 @@ function handleMessage(ws, player, raw) {
     case 'select_game': {
       const room = getRoomOf(player);
       if (!room) return sendError(ws, '请先创建或加入房间。');
-      if (room.players.size < 2) return sendError(ws, '等待第二位玩家加入后才能开始游戏。');
+      if (!requireReady(room, ws)) break;
       const game = msg.game;
       if (game !== 'soup' && game !== 'gomoku' && game !== null) {
         return sendError(ws, '未知游戏。');
@@ -370,7 +534,7 @@ function handleMessage(ws, player, raw) {
     case 'restart': {
       const room = getRoomOf(player);
       if (!room || !room.game) return sendError(ws, '当前没有进行中的游戏。');
-      if (room.players.size < 2) return sendError(ws, '等待第二位玩家加入。');
+      if (!requireReady(room, ws)) break;
       if (room.game === 'gomoku') {
         room.gomoku = newGomoku(room);
         broadcastGameState(room);
@@ -386,6 +550,7 @@ function handleMessage(ws, player, raw) {
     case 'gomoku_move': {
       const room = getRoomOf(player);
       if (!room || room.game !== 'gomoku') return sendError(ws, '当前不在五子棋对局中。');
+      if (!requireReady(room, ws)) break;
       handleGomokuMove(room, player, msg);
       break;
     }
@@ -394,6 +559,7 @@ function handleMessage(ws, player, raw) {
     case 'soup_start': {
       const room = getRoomOf(player);
       if (!room || room.game !== 'soup' || !room.soup) return sendError(ws, '当前不在海龟汤游戏中。');
+      if (!requireReady(room, ws)) break;
       const s = room.soup;
       // 允许汤主换一题（仅自己能看到汤底时直接重抽）
       if (player.id !== s.hostId) return sendError(ws, '只有汤主可以换题。');
@@ -414,6 +580,7 @@ function handleMessage(ws, player, raw) {
     case 'soup_question': {
       const room = getRoomOf(player);
       if (!room || room.game !== 'soup' || !room.soup) return sendError(ws, '当前不在海龟汤游戏中。');
+      if (!requireReady(room, ws)) break;
       const s = room.soup;
       if (s.phase !== 'playing') return sendError(ws, '本汤已揭晓，请开始新汤。');
       if (player.id !== s.guesserId) return sendError(ws, '只有猜题者可以提问。');
@@ -428,6 +595,7 @@ function handleMessage(ws, player, raw) {
     case 'soup_answer': {
       const room = getRoomOf(player);
       if (!room || room.game !== 'soup' || !room.soup) return sendError(ws, '当前不在海龟汤游戏中。');
+      if (!requireReady(room, ws)) break;
       const s = room.soup;
       if (s.phase !== 'playing') return sendError(ws, '本汤已揭晓。');
       if (player.id !== s.hostId) return sendError(ws, '只有汤主可以回答。');
@@ -448,6 +616,7 @@ function handleMessage(ws, player, raw) {
     case 'soup_guess': {
       const room = getRoomOf(player);
       if (!room || room.game !== 'soup' || !room.soup) return sendError(ws, '当前不在海龟汤游戏中。');
+      if (!requireReady(room, ws)) break;
       const s = room.soup;
       if (s.phase !== 'playing') return sendError(ws, '本汤已揭晓。');
       if (player.id !== s.guesserId) return sendError(ws, '只有猜题者可以提交最终猜测。');
@@ -463,6 +632,7 @@ function handleMessage(ws, player, raw) {
     case 'soup_verdict': {
       const room = getRoomOf(player);
       if (!room || room.game !== 'soup' || !room.soup) return sendError(ws, '当前不在海龟汤游戏中。');
+      if (!requireReady(room, ws)) break;
       const s = room.soup;
       if (player.id !== s.hostId) return sendError(ws, '只有汤主可以判定。');
       if (!s.lastGuess || s.lastGuess.verdict) return sendError(ws, '当前没有待判定的猜测。');
@@ -483,6 +653,7 @@ function handleMessage(ws, player, raw) {
     case 'soup_reveal': {
       const room = getRoomOf(player);
       if (!room || room.game !== 'soup' || !room.soup) return sendError(ws, '当前不在海龟汤游戏中。');
+      if (!requireReady(room, ws)) break;
       const s = room.soup;
       const isHost = player.id === s.hostId;
       const isGuesser = player.id === s.guesserId;
@@ -497,7 +668,7 @@ function handleMessage(ws, player, raw) {
     case 'soup_swap': {
       const room = getRoomOf(player);
       if (!room || room.game !== 'soup' || !room.soup) return sendError(ws, '当前不在海龟汤游戏中。');
-      if (room.players.size < 2) return sendError(ws, '需要两名玩家。');
+      if (!requireReady(room, ws)) break;
       const s = room.soup;
       const newHost = s.guesserId || [...room.players.keys()].find(id => id !== s.hostId);
       if (!newHost) return sendError(ws, '无法交换角色。');
@@ -510,6 +681,7 @@ function handleMessage(ws, player, raw) {
 
     case 'leave_room': {
       leaveRoom(player, '对方主动离开了房间。');
+      safeSend(ws, { type: 'room_left' });
       break;
     }
 
@@ -582,19 +754,31 @@ function lanAddresses() {
 const wss = new WebSocketServer({ server, path: '/ws' });
 
 wss.on('connection', (ws) => {
-  const player = { id: nextPlayerId++, name: '', ws, roomCode: null };
+  const connection = { session: newSession(ws) };
+  const player = connection.session;
   ws.isAlive = true;
   ws.on('pong', () => { ws.isAlive = true; });
 
-  safeSend(ws, { type: 'welcome', playerId: player.id });
+  safeSend(ws, { type: 'welcome', playerId: player.id, sessionToken: player.sessionToken });
 
   ws.on('message', (data) => {
     if (data.length > 8 * 1024) return sendError(ws, '消息过大。');
-    handleMessage(ws, player, data.toString());
+    if (connection.session.ws !== ws) return;
+    handleMessage(ws, connection, data.toString());
   });
 
   ws.on('close', () => {
-    leaveRoom(player, '对方断开了连接。');
+    const current = connection.session;
+    // 恢复/接管后，旧连接的延迟 close 不得影响新连接和房间状态。
+    if (current.ws !== ws) return;
+    if (current.roomCode) {
+      reserveDisconnectedPlayer(current, '对方暂时断开，正在保留当前对局。');
+    } else {
+      current.ws = null;
+      current.online = false;
+      sessions.delete(current.sessionToken);
+    }
+    console.log(`[game-hub] connection_closed player=${current.id} code=${ws.closeCode || 1006} durationMs=${Date.now() - current.connectedAt}`);
   });
 
   ws.on('error', () => { /* ignore */ });
@@ -612,7 +796,7 @@ const heartbeat = setInterval(() => {
 wss.on('close', () => clearInterval(heartbeat));
 
 server.listen(PORT, HOST, () => {
-  console.log(`[game-hub] 双人小游戏站已启动`);
+  console.log(`[game-hub] 双人小游戏站已启动 instance=${INSTANCE_ID}`);
   console.log(`  本机访问:   http://localhost:${PORT}`);
   const lan = lanAddresses();
   if (lan.length) {

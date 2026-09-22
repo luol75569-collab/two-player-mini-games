@@ -15,7 +15,7 @@
 | 运行环境 | Node.js ≥ 16（开发机实测 v26） |
 | 依赖 | 只有 `ws`（WebSocket 库）。没有前端依赖、没有构建步骤 |
 | 前端 | 原生 HTML / CSS / JS + Canvas，由 `server.js` 直接当静态文件提供 |
-| 数据 | 全部在内存里。进程重启 = 房间和对局清空，题库来自 `soups.json` |
+| 数据 | 房间、恢复会话和对局都在内存里。进程重启 = 房间和对局清空，题库来自 `soups.json`；同一存活进程内临时断线默认保留 5 分钟 |
 | 布局 | 移动端优先（手机竖屏是第一目标） |
 | 许可 | MIT，可自由分发 |
 
@@ -107,8 +107,8 @@ README 的待办里有「1 个汤主 + N 个猜题者」，那是**将来**的�
 
 | 方向 | 消息 |
 |---|---|
-| 服务端 → 客户端 | `welcome`、`error`、`room_update`、`peer_left`、`gomoku_state`、`soup_state`、`pong` |
-| 客户端 → 服务端 | `create_room`、`join_room`、`leave_room`、`select_game`、`restart`、`ping`、`gomoku_move`、`soup_start`、`soup_question`、`soup_answer`、`soup_guess`、`soup_verdict`、`soup_reveal`、`soup_swap` |
+| 服务端 → 客户端 | `welcome`（含只给本人的 `sessionToken`）、`error`、`room_update`、`room_left`、`peer_left`、`gomoku_state`、`soup_state`、`pong` |
+| 客户端 → 服务端 | `create_room`、`join_room`（可带 `resumeToken`）、`leave_room`、`select_game`、`restart`、`ping`、`gomoku_move`、`soup_start`、`soup_question`、`soup_answer`、`soup_guess`、`soup_verdict`、`soup_reveal`、`soup_swap` |
 
 规则：**可以新增**消息类型；**不要重命名**已有类型，**不要改变**已有字段的含义（例如 `youColor` 必须继续表示「收件人自己的颜色」，`isHost` 必须继续表示「收件人是不是汤主」）。新增消息时，在 `test/smoke.js` 里补一条断言。
 
@@ -142,17 +142,17 @@ game-hub/
 | 顶部常量 | `PORT`（读环境变量，默认 3000）、`PUBLIC_DIR`、`MIME` 表、加载 `soups.json` |
 | 房间 | 内存 `Map<code, Room>`；`genRoomCode()` 生成 4 位数字房间号；`Room` 结构见文件里的注释块 |
 | 通用工具 | `safeSend` / `broadcast` / `roomPlayers` / `sendError` / `roomUpdateFor` / `broadcastRoomUpdate` / `broadcastGameState` |
-| 房间生命周期 | `leaveRoom()`：剩 0 人删房间；剩 1 人则通知 `peer_left` 并把游戏重置回大厅 |
+| 房间生命周期 | 主动 `leave_room` 立即离开；WebSocket 临时 close 保留席位/游戏 5 分钟并暂停操作；恢复或到期回收；主动离开/到期后剩余玩家回大厅 |
 | 五子棋 | `newGomoku()`（随机先手，`turn: 1` 永远表示黑先）、`gomokuStateFor()`、`checkWin()`、`handleGomokuMove()` |
 | 海龟汤 | `newSoup()`、**`soupPublicState()`（安全边界）**、`broadcastSoupState()`、`soupLog()`（日志上限 200 条） |
 | 消息分发 | `handleMessage()` 一个大 `switch`，所有 `case` 都先检查「你在不在房间/在不在这个游戏里」 |
 | 输入清洗 | `sanitizeName()`（≤16 字）、`sanitizeText()`（≤max 字），都过滤控制字符和 `<>`、`` ` `` |
 | HTTP | `http.createServer`：`/api/info` 返回 `{ok, rooms, soups, lan}`；其余映射到 `public/`，并校验路径没有越出 `PUBLIC_DIR` |
-| WebSocket | `WebSocketServer({ server, path: '/ws' })`；连上即发 `welcome`；`message` 超过 8KB 直接拒绝；30 秒心跳 ping/pong 清理死连接 |
+| WebSocket | `WebSocketServer({ server, path: '/ws' })`；连上即发只给本人的随机 `sessionToken`；`message` 超过 8KB 直接拒绝；30 秒传输层心跳 + 前端应用层 ping/pong 清理死连接 |
 
 ### `public/app.js` 内部结构
 
-- `connect()` / `scheduleReconnect()`：断线指数退避重连，重连后用 `localStorage` 里的房间号自动 `join_room`。
+- `connect()` / `scheduleReconnect()`：连接超时、应用层心跳、带随机抖动的指数退避重连，恢复后用 `localStorage` 里的房间号和恢复凭证自动 `join_room`；`online` / `visibilitychange` / `pageshow` 会主动探测。
 - `handleServer(msg)`：唯一的服务端消息入口；`gomoku_state` / `soup_state` 到达时切页并渲染。
 - 大厅：`createBtn` / `joinBtn`（房间号必须是 4 位数字才发请求）。
 - 五子棋：`setupCanvas()` 按 `devicePixelRatio` 适配、`drawBoard()`、`drawStone()`、`boardPosFromEvent()`；点击走 `pointerdown`。
@@ -214,11 +214,11 @@ game-hub/
 ## 6. 改完之后怎么自检（提交前必须全做）
 
 ```bash
-npm test                                        # 1. 冒烟测试，必须全绿（63 项断言，退出码 0）
+npm test                                        # 1. 冒烟测试，必须全绿（当前 77 项断言，退出码 0）
 node --check server.js && node --check public/app.js && node --check test/smoke.js   # 2. 语法
 ```
 
-3. **手动过一遍**：`npm start`，浏览器开两个无痕窗口 → 一个「创建房间」、一个用房间号「加入」→ 下一盘五子棋（确认双方棋盘同步、非法落子没反应）→ 开一局海龟汤（**确认猜题者那边看不到汤底**，汤主能回答，揭晓后双方都能看到）。
+3. **手动过一遍**：`npm start`，浏览器开两个无痕窗口 → 一个「创建房间」、一个用房间号「加入」→ 下一盘五子棋（确认双方棋盘同步、非法落子没反应）→ 暂停/刷新其中一页后确认原棋盘和身份恢复、断线期间不能落子 → 开一局海龟汤（**确认猜题者那边看不到汤底**，汤主能回答，揭晓后双方都能看到）。
 4. **手机尺寸**：DevTools 切到 375×812 看有没有横向滚动；按钮是否好点。
 5. 如果改动涉及用户可见的行为，顺手更新 `README.md`（尤其是协议表和目录结构）。
 
@@ -271,5 +271,5 @@ check(实际值 === 期望值, '一句中文说明这个断言在保证什么', 
 
 1. ~~**`hints` 会下发给猜题者**~~ —— **已修复**。旧版 `soupPublicState()` 无条件下发 `hints`，猜题者的 WebSocket 消息里带着「给汤主的提示」。现在 `hints` 与汤底走同一道安全边界：默认 `[]`，只有 `isHost || phase === 'revealed'` 才填充。`test/smoke.js` 里有 3 条断言守着（猜题者 hints 为空、汤主拿到字符串数组、原始消息文本不含提示内容），**不要**把 `hints` 重新挪回 `state` 字面量里。
 2. **房间和题库都在内存里**：`server.js` 进程重启后所有房间、对局、聊天记录清零（这是设计，不是 bug）。
-3. **断线重连靠前端**：前端把房间号记在 `localStorage`，重连后自动 `join_room`；服务端会分配**新的** `playerId`，因此重连后在对局中的身份需要重新由服务端按新玩家算（重新加入时房间如果已满 2 人，会走「房间已满」分支——极端情况下重连可能失败，这是当前实现的已知粗糙处）。
+3. **断线恢复有边界**：v0.2 把随机恢复凭证保存在客户端 `localStorage`，同一存活 Node 进程内可恢复原 `playerId`、席位和对局；主动离开、恢复期限到期、服务重启或多实例切换后无法恢复。恢复凭证不能跨房间使用，第三人不能占用被保留的席位。
 4. **没有 CI**：仓库没有配置 GitHub Actions，`npm test` 是唯一的自动化验证手段。改动后请务必本地跑通再提交。

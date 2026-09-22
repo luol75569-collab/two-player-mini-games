@@ -1,5 +1,7 @@
 # 🎮 game-hub · 双人小游戏站
 
+当前发布序列：**v0.2**。`package.json` 的 `0.2.0` 对应本项目的 v0.2 修复版；修复前的原始仓库基线标记为 v0.1。此前的 `1.0.0` 只是最初脚手架版本号。
+
 一个**手机上就能玩**的本地双人小游戏网站：**海龟汤** + **15×15 五子棋**。
 
 两个人在同一个 Wi-Fi 下，各自用手机浏览器打开网址，输入 4 位房间号就能开局。不需要装 App、不需要注册、不需要账号。
@@ -24,7 +26,9 @@
 ### 🏠 房间系统
 - 4 位数字房间号，最多 2 人
 - 第三人加入会被拒绝
-- 支持断线重连、对方离开提醒
+- 支持短暂断线恢复：玩家凭证与 WebSocket 分离，默认保留席位和对局 5 分钟
+- 断线期间对局暂停，恢复后沿用原身份、棋盘、轮次、汤面和提问记录
+- 主动离开、恢复期限到期或服务重启会结束房间，并提示重新创建/加入
 
 ## 🚀 快速开始
 
@@ -63,6 +67,17 @@ npm start
 - 静态文件由服务端自身提供，无需额外的 Nginx
 - 前端**不依赖任何 CDN 或网络字体**，纯本地资源，内网也能完整运行
 
+### 断线恢复的边界
+
+v0.2 的恢复状态仍在 Node 进程内存中。它能处理同一存活进程内的手机切换微信、短暂断网、页面刷新和 WebSocket 重建，但**不能跨进程重启、跨 Vercel 实例或跨区域实例恢复**。恢复凭证本身也不会把房间状态写入云端。
+
+本仓库没有 `vercel.json` 或其他 Vercel 专用部署配置，`server.js` 是常驻 Node 服务的启动入口。Vercel 当前可以建立 WebSocket，但函数最大时长、实例重新分配和内存隔离仍可能让内存房间消失；因此要稳定公网使用，建议部署到可保持单个常驻 Node 进程的主机，并配置：
+
+1. `npm install --omit=dev && npm start`，由平台把 `PORT` 注入进程。
+2. 反向代理把 `/` 和 `/api/info` 转发到 Node HTTP 端口，并把 `/ws` 配置为 WebSocket Upgrade 长连接。
+3. 使用进程管理器或平台服务守护进程，在异常退出后重新启动；健康检查请求 `/api/info`。
+4. 若必须使用多实例/无服务器函数，需要额外的共享存储、分布式锁和 WebSocket 消息分发，并改造房间状态层；仅增加内存 token 不能解决这个问题。
+
 ## 📁 目录结构
 
 ```
@@ -86,11 +101,14 @@ game-hub/
 
 | 分类 | 消息 |
 |---|---|
-| 房间 | `create_room`、`join_room`、`leave_room`、`select_game`、`restart`、`ping` |
+| 服务端状态 | `welcome`（含仅发给当前连接的 `sessionToken`）、`error`、`room_update`、`room_left`、`peer_left`、`pong` |
+| 房间 | `create_room`、`join_room`（可带 `resumeToken`）、`leave_room`、`select_game`、`restart`、`ping` |
 | 五子棋 | `gomoku_move` → 服务端广播 `gomoku_state` |
 | 海龟汤 | `soup_start`、`soup_question`、`soup_answer`、`soup_guess`、`soup_verdict`、`soup_reveal`、`soup_swap` |
 
 设计原则：**不信任客户端**——落子合法性、胜负判定、汤主权限、汤底下发全部由服务端把关。
+
+`peer_left.temporary === true` 表示临时断线，`reconnectUntil` 是服务端给出的保留截止时间；此时 `gomoku_state` / `soup_state` / `room_update` 的 `paused` 为 `true`，客户端不应提交改变对局的操作。恢复成功时 `room_update.resumed === true`，随后服务端重新发送完整游戏状态。
 
 ## 🗺️ 后续想做的
 
