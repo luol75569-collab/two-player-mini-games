@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <meta name="theme-color" content="#f5efe0">
+  <title>双人小游戏站 · 海龟汤 &amp; 五子棋</title>
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%23f5efe0' stroke='%233d3d3d' stroke-width='4'/%3E%3Ccircle cx='36' cy='40' r='13' fill='%23333333' stroke='%233d3d3d' stroke-width='3'/%3E%3Ccircle cx='64' cy='62' r='13' fill='%23ffffff' stroke='%233d3d3d' stroke-width='3'/%3E%3Cpath d='M20 80 Q50 60 80 78' stroke='%23e0604f' stroke-width='6' fill='none' stroke-linecap='round'/%3E%3C/svg%3E" type="image/svg+xml">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <!-- 连接状态条 -->
+  <div id="connBar" class="conn-bar hidden">✏️ 连接已断开，正在重连…</div>
+
+  <!-- ============ 大厅 ============ -->
+  <section id="lobby" class="page">
+    <div class="card hero taped">
+      <svg class="doodle-star ds-1" viewBox="0 0 40 40" aria-hidden="true"><path d="M20 4 L24 15 L36 16 L26 23 L30 35 L20 28 L10 35 L14 23 L4 16 L16 15 Z"/></svg>
+      <svg class="doodle-arrow da-1" viewBox="0 0 70 40" aria-hidden="true"><path d="M6 30 C 22 10, 44 8, 58 18" fill="none"/><path d="M50 8 L60 20 L44 22" fill="none"/></svg>
+      <h1>双人小游戏站</h1>
+      <div class="subtitle-scribble" aria-hidden="true"></div>
+      <p class="sub">海龟汤 · 15×15 五子棋 —— 同一 Wi-Fi，两台设备就能玩</p>
+      <div class="lan-tip">
+        <p>💻 本机访问：<code>localhost:3000</code></p>
+        <p>📱 手机访问：电脑局域网 IP <code>:3000</code><br><span class="muted">（手机与电脑连同一个 Wi-Fi，IP 见服务启动日志，如 <code>http://192.168.x.x:3000</code>）</span></p>
+      </div>
+    </div>
+
+    <div class="card">
+      <svg class="doodle-spiral dsp-1" viewBox="0 0 40 40" aria-hidden="true"><path d="M20 20 m0 -2 c6 -6 14 2 10 10 c-4 10 -20 8 -24 -2 c-4 -12 8 -24 22 -20" fill="none"/></svg>
+      <label class="field">
+        <span>你的昵称</span>
+        <input id="nameInput" type="text" maxlength="16" placeholder="不填则自动编号" autocomplete="off">
+      </label>
+      <button id="createBtn" class="btn btn-primary btn-block">✎ 创建房间</button>
+      <div class="divider"><span>或</span></div>
+      <label class="field">
+        <span>4 位房间号</span>
+        <input id="joinCodeInput" type="text" inputmode="numeric" pattern="[0-9]*" maxlength="4" placeholder="例如 1234" autocomplete="off">
+      </label>
+      <button id="joinBtn" class="btn btn-secondary btn-block">➜ 加入房间</button>
+      <p id="lobbyError" class="error-text"></p>
+    </div>
+  </section>
+
+  <!-- ============ 房间大厅 ============ -->
+  <section id="room" class="page hidden">
+    <div class="card room-code-card taped">
+      <div class="room-head">
+        <div>
+          <div class="room-code-label">房间号</div>
+          <div class="room-code" id="roomCode">----</div>
+        </div>
+        <button id="copyCodeBtn" class="btn btn-small">复制</button>
+      </div>
+      <div id="playerList" class="player-list"></div>
+      <p id="waitTip" class="muted hidden">⏳ 等待第二位玩家加入，把房间号告诉 TA 吧！</p>
+    </div>
+
+    <div class="card">
+      <h2>选择游戏</h2>
+      <div class="game-cards">
+        <button id="pickSoup" class="game-card gc-soup" disabled>
+          <span class="game-emoji">🍲</span>
+          <span class="game-name">海龟汤</span>
+          <span class="game-desc">一人当汤主，一人提问推理</span>
+        </button>
+        <button id="pickGomoku" class="game-card gc-gomoku" disabled>
+          <span class="game-emoji">⚫⚪</span>
+          <span class="game-name">五子棋</span>
+          <span class="game-desc">15×15，五连即胜</span>
+        </button>
+      </div>
+      <button id="leaveRoomBtn" class="btn btn-ghost btn-block">离开房间</button>
+    </div>
+  </section>
+
+  <!-- ============ 五子棋 ============ -->
+  <section id="gomoku" class="page hidden">
+    <div class="card gomoku-status-card">
+      <div id="gomokuStatus" class="gomoku-status">准备中…</div>
+      <div id="gomokuPlayers" class="gomoku-players"></div>
+    </div>
+    <div class="board-wrap">
+      <canvas id="board" class="board" aria-label="五子棋棋盘"></canvas>
+    </div>
+    <div class="card row">
+      <button id="gomokuRestart" class="btn btn-secondary">↻ 再来一局</button>
+      <button id="gomokuBack" class="btn btn-ghost">返回房间</button>
+    </div>
+  </section>
+
+  <!-- ============ 海龟汤 ============ -->
+  <section id="soup" class="page hidden">
+    <div class="card soup-surface taped tilt-back">
+      <svg class="doodle-turtle" viewBox="0 0 60 40" aria-hidden="true">
+        <ellipse cx="30" cy="24" rx="17" ry="11"/>
+        <circle cx="50" cy="16" r="5"/>
+        <path d="M13 24 L6 20 M13 28 L5 30" fill="none"/>
+        <circle cx="52" cy="15" r="1" fill="#3d3d3d"/>
+      </svg>
+      <div class="soup-title-row">
+        <h2 id="soupTitle">海龟汤</h2>
+        <span id="soupRole" class="role-badge"></span>
+      </div>
+      <p id="soupSurface" class="surface-text"></p>
+      <div id="soupHints" class="hints hidden"></div>
+    </div>
+
+    <!-- 汤主底牌 -->
+    <div id="hostPanel" class="card host-panel taped">
+      <button id="answerToggle" class="btn btn-small btn-block">👁 查看汤底（仅你可见）</button>
+      <div id="answerBox" class="answer-box hidden"></div>
+      <div class="host-actions">
+        <p class="muted small" id="hostPending">等待猜题者提问…</p>
+        <div class="answer-btns">
+          <button class="btn btn-answer stamp-yes" data-answer="yes">是</button>
+          <button class="btn btn-answer stamp-no" data-answer="no">否</button>
+          <button class="btn btn-answer stamp-irr" data-answer="irrelevant">无关</button>
+          <button class="btn btn-answer stamp-rep" data-answer="rephrase">换个问法</button>
+        </div>
+        <div id="verdictBox" class="verdict-box hidden">
+          <p class="small">猜题者提交了最终推理，判定：</p>
+          <div class="row">
+            <button id="verdictPass" class="btn btn-primary">✅ 猜对了</button>
+            <button id="verdictFail" class="btn btn-secondary">❌ 继续猜</button>
+          </div>
+        </div>
+        <div class="row">
+          <button id="hostReveal" class="btn btn-ghost">揭晓汤底</button>
+          <button id="hostNewSoup" class="btn btn-ghost">换一道题</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 猜题者操作区 -->
+    <div id="guesserPanel" class="card guesser-panel">
+      <div class="ask-row">
+        <input id="questionInput" type="text" maxlength="200" placeholder="输入一个是非问题…" autocomplete="off">
+        <button id="askBtn" class="btn btn-primary">提问</button>
+      </div>
+      <div class="row">
+        <button id="finalGuessBtn" class="btn btn-secondary">提交最终推理</button>
+        <button id="giveUpBtn" class="btn btn-ghost">放弃看汤底</button>
+      </div>
+    </div>
+
+    <!-- 揭晓后的汤底 -->
+    <div id="revealedPanel" class="card revealed">
+      <svg class="confetti" viewBox="0 0 200 90" aria-hidden="true">
+        <path class="cf-1" d="M20 12 q4 6 -2 10" fill="none"/>
+        <path class="cf-2" d="M55 6 q-5 7 2 12" fill="none"/>
+        <path class="cf-3" d="M95 14 q5 6 -1 11" fill="none"/>
+        <path class="cf-4" d="M140 5 q-4 7 3 12" fill="none"/>
+        <path class="cf-5" d="M175 15 q4 6 -2 10" fill="none"/>
+        <rect class="cr-1" x="35" y="26" width="7" height="7" transform="rotate(18 38 29)"/>
+        <rect class="cr-2" x="78" y="32" width="7" height="7" transform="rotate(-14 81 35)"/>
+        <rect class="cr-3" x="118" y="24" width="7" height="7" transform="rotate(24 121 27)"/>
+        <rect class="cr-4" x="158" y="30" width="7" height="7" transform="rotate(-20 161 33)"/>
+        <circle class="cc-1" cx="50" cy="18" r="2.4"/>
+        <circle class="cc-2" cx="110" cy="22" r="2.4"/>
+        <circle class="cc-3" cx="165" cy="10" r="2.4"/>
+      </svg>
+      <h3>🎉 汤底揭晓</h3>
+      <p id="revealedAnswer" class="surface-text"></p>
+      <div class="row">
+        <button id="swapBtn" class="btn btn-primary">交换角色再来一汤</button>
+        <button id="soupBack" class="btn btn-ghost">返回房间</button>
+      </div>
+    </div>
+
+    <!-- 聊天记录 -->
+    <div class="card chat-card">
+      <h3>提问记录</h3>
+      <div id="chatLog" class="chat-log"></div>
+    </div>
+
+    <div class="card row" id="soupNavCard">
+      <button id="soupBack2" class="btn btn-ghost btn-block">返回房间</button>
+    </div>
+  </section>
+
+  <!-- 最终推理弹窗 -->
+  <div id="guessModal" class="modal hidden">
+    <div class="modal-box">
+      <h3>✎ 提交最终推理</h3>
+      <textarea id="guessText" rows="4" maxlength="300" placeholder="完整描述你推理出的真相…"></textarea>
+      <div class="row">
+        <button id="guessSubmit" class="btn btn-primary">提交</button>
+        <button id="guessCancel" class="btn btn-ghost">取消</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 通用提示 -->
+  <div id="toast" class="toast hidden"></div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

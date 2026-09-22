@@ -1,0 +1,17 @@
+{
+  "name": "game-hub",
+  "version": "1.0.0",
+  "private": true,
+  "description": "本地双人小游戏站：海龟汤 + 15x15 五子棋（Node.js + ws，原生前端）",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test/smoke.js"
+  },
+  "engines": {
+    "node": ">=16"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
