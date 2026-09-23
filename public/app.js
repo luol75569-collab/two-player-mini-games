@@ -342,8 +342,10 @@
         clearRestoreTimer();
         state.gomoku = msg;
         state.game = 'gomoku';
-        renderGomoku();
         showPage('gomoku');
+        // 必须先显示页面再测量 canvas；隐藏元素的 clientWidth 为 0，
+        // 否则刷新恢复时会按兜底尺寸绘制，之后点击坐标会整体偏移。
+        renderGomoku();
         break;
       case 'soup_state':
         clearRestoreTimer();
@@ -458,7 +460,9 @@
 
   function setupCanvas() {
     const dpr = window.devicePixelRatio || 1;
-    const cssSize = canvas.clientWidth || 300;
+    // clientWidth/clientHeight 已经排除 canvas border，正好对应绘图内容区。
+    const cssSize = Math.min(canvas.clientWidth, canvas.clientHeight);
+    if (!Number.isFinite(cssSize) || cssSize <= 0) return false;
     canvas.width = Math.round(cssSize * dpr);
     canvas.height = Math.round(cssSize * dpr);
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -469,11 +473,12 @@
       cell: (cssSize - pad * 2) / 14,
       size: 15,
     };
+    return true;
   }
 
   function drawBoard() {
     if (!state.gomoku) return;
-    setupCanvas();
+    if (!setupCanvas()) return;
     const { pad, cell, px } = boardMetrics;
     const g = state.gomoku;
 
@@ -564,8 +569,42 @@
     const rect = canvas.getBoundingClientRect();
     const clientX = ev.clientX !== undefined ? ev.clientX : (ev.touches && ev.touches[0].clientX);
     const clientY = ev.clientY !== undefined ? ev.clientY : (ev.touches && ev.touches[0].clientY);
-    const px = clientX - rect.left;
-    const py = clientY - rect.top;
+    if (!Number.isFinite(clientX) || !Number.isFinite(clientY) || !boardMetrics.px) return null;
+
+    // board-wrap 有轻微旋转，getBoundingClientRect() 是旋转后的包围盒，
+    // 直接减 rect.left/top 会把角点映射到错误的格子。先把屏幕坐标
+    // 逆变换回 canvas 未旋转的布局坐标，再扣除 canvas 边框。
+    let a = 1, b = 0, c = 0, d = 1;
+    let transformEl = canvas;
+    while (transformEl && transformEl !== document.body) {
+      const transform = getComputedStyle(transformEl).transform;
+      if (transform && transform !== 'none') {
+        const values = transform.match(/^matrix\(([^)]+)\)$/);
+        const values3d = transform.match(/^matrix3d\(([^)]+)\)$/);
+        if (values) {
+          const m = values[1].split(',').map(Number);
+          [a, b, c, d] = [m[0], m[1], m[2], m[3]];
+        } else if (values3d) {
+          const m = values3d[1].split(',').map(Number);
+          [a, b, c, d] = [m[0], m[1], m[4], m[5]];
+        }
+        break;
+      }
+      transformEl = transformEl.parentElement;
+    }
+
+    const determinant = a * d - b * c;
+    if (!Number.isFinite(determinant) || Math.abs(determinant) < 1e-6) return null;
+    const outerWidth = canvas.offsetWidth || canvas.clientWidth;
+    const outerHeight = canvas.offsetHeight || canvas.clientHeight;
+    const dx = clientX - (rect.left + rect.width / 2);
+    const dy = clientY - (rect.top + rect.height / 2);
+    const localX = (d * dx - c * dy) / determinant + outerWidth / 2;
+    const localY = (-b * dx + a * dy) / determinant + outerHeight / 2;
+    const borderLeft = parseFloat(getComputedStyle(canvas).borderLeftWidth) || 0;
+    const borderTop = parseFloat(getComputedStyle(canvas).borderTopWidth) || 0;
+    const px = localX - borderLeft;
+    const py = localY - borderTop;
     const { pad, cell } = boardMetrics;
     const x = Math.round((px - pad) / cell);
     const y = Math.round((py - pad) / cell);
