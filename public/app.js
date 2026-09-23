@@ -41,12 +41,15 @@
     reconnectTimer: null,
     reconnectDelay: 1000,
     connectTimer: null,
+    restoreTimer: null,
+    socketAbortTimer: null,
     heartbeatTimer: null,
     lastPongAt: 0,
     connectionState: 'idle', // connecting | restoring | ready | failed
     latestSessionToken: '',
     offlineUntil: null,
     offlineTimer: null,
+    sessionReplaced: false,
   };
 
   $('nameInput').value = state.name;
@@ -69,23 +72,82 @@
     clearTimeout(state.offlineTimer);
     if (state.offlineUntil && state.offlineUntil > Date.now()) {
       setConnBar(`对方暂时离线，当前对局保留 ${remainingText(state.offlineUntil)}，正在等待恢复…`);
+      updateActionAvailability();
       state.offlineTimer = setTimeout(renderConnectionNotice, 1000);
       return;
     }
     if (state.offlineUntil) {
       state.offlineUntil = null;
       setConnBar('恢复期限已到，请重新创建或加入房间。');
+      updateActionAvailability();
       return;
     }
     if (state.connectionState === 'connecting') setConnBar('正在连接…');
     else if (state.connectionState === 'restoring') setConnBar('正在恢复房间和对局…');
     else if (state.connectionState === 'failed') setConnBar('恢复失败，请重新创建或加入房间。');
     else if (state.connectionState === 'ready') setConnBar('', false);
+    updateActionAvailability();
+  }
+
+  const GAME_ACTIONS = new Set([
+    'select_game', 'restart', 'gomoku_move', 'soup_start', 'soup_question',
+    'soup_answer', 'soup_guess', 'soup_verdict', 'soup_reveal', 'soup_swap',
+  ]);
+
+  function canUseTransport() {
+    return !!state.ws && state.ws.readyState === WebSocket.OPEN &&
+      !state.sessionReplaced && state.connectionState !== 'connecting' && state.connectionState !== 'restoring';
+  }
+
+  function canUseGameActions() {
+    return canUseTransport() && state.connectionState === 'ready' && !state.offlineUntil;
+  }
+
+  function updateActionAvailability() {
+    const connected = canUseTransport();
+    const roomReady = canUseGameActions();
+    $('createBtn').disabled = !connected;
+    $('joinBtn').disabled = !connected;
+    $('pickSoup').disabled = !roomReady || state.players.length < 2;
+    $('pickGomoku').disabled = !roomReady || state.players.length < 2;
+    $('leaveRoomBtn').disabled = !connected;
   }
 
   function stopHeartbeat() {
     clearInterval(state.heartbeatTimer);
     state.heartbeatTimer = null;
+  }
+
+  function clearRestoreTimer() {
+    clearTimeout(state.restoreTimer);
+    state.restoreTimer = null;
+  }
+
+  function startRestoreTimer(ws) {
+    clearRestoreTimer();
+    state.restoreTimer = setTimeout(() => {
+      if (state.ws !== ws || state.connectionState !== 'restoring') return;
+      // 网络慢只代表本次恢复请求超时，不能把仍可能有效的房间凭证当成失效凭证删除。
+      state.offlineUntil = null;
+      state.connectionState = 'failed';
+      renderConnectionNotice();
+      showPage('lobby');
+      toast('房间恢复超时，请重新创建或加入房间。');
+    }, 8000);
+  }
+
+  function abandonUnresponsiveSocket(ws) {
+    if (state.ws !== ws) return;
+    clearTimeout(state.socketAbortTimer);
+    state.socketAbortTimer = setTimeout(() => {
+      if (state.ws !== ws) return;
+      state.ws = null;
+      stopHeartbeat();
+      state.connectionState = 'connecting';
+      setConnBar(state.roomCode ? '连接无响应，正在恢复房间…' : '连接无响应，正在重连…');
+      scheduleReconnect();
+    }, 2000);
+    try { ws.close(4001, 'heartbeat timeout'); } catch (_) { /* ignore */ }
   }
 
   function startHeartbeat(ws) {
@@ -94,7 +156,7 @@
     state.heartbeatTimer = setInterval(() => {
       if (state.ws !== ws || ws.readyState !== WebSocket.OPEN) return;
       if (Date.now() - state.lastPongAt > 32000) {
-        try { ws.close(4001, 'heartbeat timeout'); } catch (_) { /* ignore */ }
+        abandonUnresponsiveSocket(ws);
         return;
       }
       try { ws.send(JSON.stringify({ type: 'ping' })); } catch (_) { /* onclose 会处理 */ }
@@ -107,6 +169,7 @@
   }
 
   function connect() {
+    if (state.sessionReplaced) return;
     if (state.ws && (state.ws.readyState === 0 || state.ws.readyState === 1)) return;
     clearTimeout(state.reconnectTimer);
     state.reconnectTimer = null;
@@ -130,6 +193,7 @@
       startHeartbeat(ws);
       // 只有收到 room_update / 游戏状态后，才会被视为已恢复。
       if (state.roomCode) {
+        startRestoreTimer(ws);
         sendOnSocket(ws, {
           type: 'join_room',
           code: state.roomCode,
@@ -146,12 +210,21 @@
       handleServer(msg);
     };
 
-    ws.onclose = () => {
+    ws.onclose = (event) => {
       if (state.ws !== ws) return;
       clearTimeout(state.connectTimer);
       state.connectTimer = null;
+      clearTimeout(state.socketAbortTimer);
+      state.socketAbortTimer = null;
       state.ws = null;
       stopHeartbeat();
+      clearRestoreTimer();
+      if (state.sessionReplaced || event.code === 4002) {
+        state.connectionState = 'failed';
+        setConnBar('此标签页已被另一连接接管，请刷新页面后恢复。');
+        updateActionAvailability();
+        return;
+      }
       state.connectionState = 'connecting';
       setConnBar(state.roomCode ? '连接已断开，正在恢复房间…' : '连接已断开，正在重连…');
       scheduleReconnect();
@@ -178,6 +251,14 @@
   }
 
   function send(obj) {
+    if (obj.type !== 'ping' && !canUseTransport()) {
+      toast(state.sessionReplaced ? '当前标签页已被另一连接接管，请刷新页面。' : '正在恢复连接，请稍候…');
+      return false;
+    }
+    if (GAME_ACTIONS.has(obj.type) && !canUseGameActions()) {
+      toast('当前对局未同步完成，暂时不能操作。');
+      return false;
+    }
     if (sendOnSocket(state.ws, obj)) {
       return true;
     }
@@ -192,13 +273,23 @@
       case 'welcome':
         state.playerId = msg.playerId;
         state.latestSessionToken = msg.sessionToken || '';
-        if (!state.resumeToken && msg.sessionToken) {
+        state.sessionReplaced = false;
+        // 大厅没有待恢复的房间时，必须换成当前连接的新凭证；房间恢复期间保留旧凭证，等待服务端确认。
+        if ((!state.roomCode || !state.resumeToken) && msg.sessionToken) {
           state.resumeToken = msg.sessionToken;
           localStorage.setItem('gh_resume', msg.sessionToken);
         }
         break;
+      case 'session_replaced':
+        state.sessionReplaced = true;
+        state.connectionState = 'failed';
+        setConnBar('此标签页已被另一连接接管，请刷新页面后恢复。');
+        toast(msg.message || '此标签页已被另一连接接管');
+        updateActionAvailability();
+        break;
       case 'error':
-        if (msg.code === 'resume_invalid') {
+        if ((msg.code === 'resume_invalid' || msg.code === 'room_not_found') && state.roomCode) {
+          clearRestoreTimer();
           state.resumeToken = state.latestSessionToken;
           state.roomCode = '';
           state.game = null;
@@ -218,6 +309,12 @@
         }
         break;
       case 'room_update':
+        clearRestoreTimer();
+        if (msg.resumeToken) {
+          state.resumeToken = msg.resumeToken;
+          state.latestSessionToken = msg.resumeToken;
+          localStorage.setItem('gh_resume', msg.resumeToken);
+        }
         onRoomUpdate(msg);
         break;
       case 'peer_left':
@@ -242,12 +339,14 @@
         state.lastPongAt = Date.now();
         break;
       case 'gomoku_state':
+        clearRestoreTimer();
         state.gomoku = msg;
         state.game = 'gomoku';
         renderGomoku();
         showPage('gomoku');
         break;
       case 'soup_state':
+        clearRestoreTimer();
         state.soup = msg;
         state.game = 'soup';
         renderSoup();
@@ -341,10 +440,12 @@
   $('leaveRoomBtn').addEventListener('click', () => {
     send({ type: 'leave_room' });
     state.roomCode = '';
-    state.resumeToken = '';
+    // 主动离开只清房间，不清当前连接仍有效的会话凭证；同一 socket 随后创建新房间时会继续使用它。
+    state.resumeToken = state.latestSessionToken || state.resumeToken;
     state.offlineUntil = null;
     localStorage.removeItem('gh_room');
-    localStorage.removeItem('gh_resume');
+    if (state.resumeToken) localStorage.setItem('gh_resume', state.resumeToken);
+    else localStorage.removeItem('gh_resume');
     state.gomoku = null;
     state.soup = null;
     showPage('lobby');
@@ -474,7 +575,7 @@
 
   canvas.addEventListener('pointerdown', (ev) => {
     ev.preventDefault();
-    if (!state.gomoku || state.gomoku.winner) return;
+    if (!state.gomoku || state.gomoku.winner || !canUseGameActions()) return;
     const pos = boardPosFromEvent(ev);
     if (!pos) return;
     send({ type: 'gomoku_move', x: pos.x, y: pos.y });
@@ -517,7 +618,7 @@
     }
 
     drawBoard();
-    $('gomokuRestart').disabled = !!g.paused;
+    $('gomokuRestart').disabled = !!g.paused || !canUseGameActions();
   }
 
   $('gomokuRestart').addEventListener('click', () => send({ type: 'restart' }));
@@ -583,7 +684,7 @@
     }
 
     ['hostReveal', 'hostNewSoup', 'verdictPass', 'verdictFail', 'askBtn', 'finalGuessBtn', 'giveUpBtn', 'swapBtn']
-      .forEach((id) => { if ($(id)) $(id).disabled = paused; });
+      .forEach((id) => { if ($(id)) $(id).disabled = paused || !canUseGameActions(); });
     $('questionInput').disabled = paused;
 
     renderChat(s.log || []);
@@ -649,6 +750,7 @@
 
   // 猜题者：最终推理弹窗
   $('finalGuessBtn').addEventListener('click', () => {
+    if (!canUseGameActions()) return toast('当前对局未同步完成，暂时不能操作。');
     $('guessText').value = '';
     $('guessModal').classList.remove('hidden');
     setTimeout(() => $('guessText').focus(), 50);
@@ -678,6 +780,7 @@
   });
 
   function syncRoom() {
+    if (state.sessionReplaced) return;
     if (!state.roomCode) {
       if (!state.ws || state.ws.readyState !== WebSocket.OPEN) connect();
       return;
@@ -697,9 +800,21 @@
   }
 
   window.addEventListener('online', syncRoom);
-  window.addEventListener('pageshow', syncRoom);
+  window.addEventListener('pageshow', () => {
+    if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+      state.lastPongAt = Date.now();
+      sendOnSocket(state.ws, { type: 'ping' });
+    }
+    syncRoom();
+  });
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible') syncRoom();
+    if (document.visibilityState === 'visible') {
+      if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+        state.lastPongAt = Date.now();
+        sendOnSocket(state.ws, { type: 'ping' });
+      }
+      syncRoom();
+    }
   });
 
   // ---------- 启动 ----------

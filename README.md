@@ -101,7 +101,7 @@ game-hub/
 
 | 分类 | 消息 |
 |---|---|
-| 服务端状态 | `welcome`（含仅发给当前连接的 `sessionToken`）、`error`、`room_update`、`room_left`、`peer_left`、`pong` |
+| 服务端状态 | `welcome`（含仅发给当前连接的 `sessionToken`）、`error`、`room_update`（仅当前收件人的 `resumeToken`）、`room_left`、`peer_left`、`session_replaced`、`pong` |
 | 房间 | `create_room`、`join_room`（可带 `resumeToken`）、`leave_room`、`select_game`、`restart`、`ping` |
 | 五子棋 | `gomoku_move` → 服务端广播 `gomoku_state` |
 | 海龟汤 | `soup_start`、`soup_question`、`soup_answer`、`soup_guess`、`soup_verdict`、`soup_reveal`、`soup_swap` |
@@ -109,6 +109,8 @@ game-hub/
 设计原则：**不信任客户端**——落子合法性、胜负判定、汤主权限、汤底下发全部由服务端把关。
 
 `peer_left.temporary === true` 表示临时断线，`reconnectUntil` 是服务端给出的保留截止时间；此时 `gomoku_state` / `soup_state` / `room_update` 的 `paused` 为 `true`，客户端不应提交改变对局的操作。恢复成功时 `room_update.resumed === true`，随后服务端重新发送完整游戏状态。
+
+`error.code` 中，`resume_invalid` 表示恢复凭证失效，`room_not_found` 表示房间已过期或服务重启后不存在；客户端只在这类服务端明确结果下清理本地房间信息。`session_replaced` 表示同一恢复凭证已被另一连接接管，旧标签页会停止自动重连，刷新页面后才可再次恢复。
 
 ## 🗺️ 后续想做的
 

@@ -107,7 +107,7 @@ README 的待办里有「1 个汤主 + N 个猜题者」，那是**将来**的�
 
 | 方向 | 消息 |
 |---|---|
-| 服务端 → 客户端 | `welcome`（含只给本人的 `sessionToken`）、`error`、`room_update`、`room_left`、`peer_left`、`gomoku_state`、`soup_state`、`pong` |
+| 服务端 → 客户端 | `welcome`（含只给本人的 `sessionToken`）、`error`、`room_update`（只给当前收件人的 `resumeToken`）、`room_left`、`peer_left`、`session_replaced`、`gomoku_state`、`soup_state`、`pong` |
 | 客户端 → 服务端 | `create_room`、`join_room`（可带 `resumeToken`）、`leave_room`、`select_game`、`restart`、`ping`、`gomoku_move`、`soup_start`、`soup_question`、`soup_answer`、`soup_guess`、`soup_verdict`、`soup_reveal`、`soup_swap` |
 
 规则：**可以新增**消息类型；**不要重命名**已有类型，**不要改变**已有字段的含义（例如 `youColor` 必须继续表示「收件人自己的颜色」，`isHost` 必须继续表示「收件人是不是汤主」）。新增消息时，在 `test/smoke.js` 里补一条断言。
@@ -214,7 +214,7 @@ game-hub/
 ## 6. 改完之后怎么自检（提交前必须全做）
 
 ```bash
-npm test                                        # 1. 冒烟测试，必须全绿（当前 77 项断言，退出码 0）
+npm test                                        # 1. 冒烟测试，必须全绿（当前 82 项断言，退出码 0）
 node --check server.js && node --check public/app.js && node --check test/smoke.js   # 2. 语法
 ```
 

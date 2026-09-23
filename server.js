@@ -320,12 +320,15 @@ function soupLog(room, entry) {
 
 // ---------- 房间通用状态 ----------
 function roomUpdateFor(room, viewerId, extra) {
+  const viewer = room.players.get(viewerId);
   return {
     type: 'room_update',
     code: room.code,
     players: roomPlayers(room),
     game: room.game,
     you: viewerId,
+    // 只给当前收件人确认自己这条仍有效的会话/恢复凭证，不能放进广播共用对象。
+    resumeToken: viewer ? viewer.sessionToken : null,
     ...roomStatusFor(room),
     ...(extra || {}),
   };
@@ -436,6 +439,18 @@ function attachSession(connection, session, ws) {
   if (connection.session && connection.session !== session) {
     sessions.delete(connection.session.sessionToken);
   }
+  if (session.ws && session.ws !== ws) {
+    safeSend(session.ws, {
+      type: 'session_replaced',
+      code: 'session_replaced',
+      message: '此恢复凭证已被另一连接接管，当前标签页将停止自动重连。',
+    });
+    try {
+      if (session.ws.readyState === 0 || session.ws.readyState === 1) {
+        session.ws.close(4002, 'session_replaced');
+      }
+    } catch (_) { /* ignore */ }
+  }
   clearDisconnectTimer(session);
   session.ws = ws;
   session.online = true;
@@ -479,7 +494,7 @@ function handleMessage(ws, connection, raw) {
     case 'join_room': {
       const code = String(msg.code || '').trim();
       const room = rooms.get(code);
-      if (!room) return sendError(ws, '房间不存在，请核对 4 位房间号。');
+      if (!room) return sendError(ws, '房间不存在，请重新创建或核对 4 位房间号。', 'room_not_found');
       let resumed = false;
       const resumeToken = typeof msg.resumeToken === 'string' ? msg.resumeToken : '';
       if (resumeToken) {
@@ -767,7 +782,7 @@ wss.on('connection', (ws) => {
     handleMessage(ws, connection, data.toString());
   });
 
-  ws.on('close', () => {
+  ws.on('close', (code, reason) => {
     const current = connection.session;
     // 恢复/接管后，旧连接的延迟 close 不得影响新连接和房间状态。
     if (current.ws !== ws) return;
@@ -778,7 +793,8 @@ wss.on('connection', (ws) => {
       current.online = false;
       sessions.delete(current.sessionToken);
     }
-    console.log(`[game-hub] connection_closed player=${current.id} code=${ws.closeCode || 1006} durationMs=${Date.now() - current.connectedAt}`);
+    const closeReason = Buffer.isBuffer(reason) ? reason.toString('utf8').replace(/[\x00-\x1f]/g, '').slice(0, 80) : '';
+    console.log(`[game-hub] connection_closed player=${current.id} code=${Number.isInteger(code) ? code : 1006} reason=${closeReason || '-'} durationMs=${Date.now() - current.connectedAt}`);
   });
 
   ws.on('error', () => { /* ignore */ });

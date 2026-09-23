@@ -285,6 +285,7 @@ async function main() {
     a.c.send({ type: 'create_room', name: '甲' });
     const roomA = await a.c.waitFor((m) => m.type === 'room_update', 'room_update（创建房间）');
     check(/^\d{4}$/.test(String(roomA.code)), `创建房间返回 4 位数字房间号（${roomA.code}）`);
+    check(roomA.resumeToken === a.welcome.sessionToken, '创建房间后只向本人确认当前有效恢复凭证');
     check(roomA.players.length === 1 && roomA.game === null, '创建后房间里只有 1 人，且还没选游戏');
 
     let b = await connectClient(port, '玩家B');
@@ -292,6 +293,7 @@ async function main() {
     b.c.send({ type: 'join_room', code: roomA.code, name: '乙' });
     const roomB = await b.c.waitFor((m) => m.type === 'room_update', 'room_update（加入房间）');
     check(roomB.players.length === 2, '第二名玩家用房间号加入成功，房间内 2 人');
+    check(roomB.resumeToken === b.welcome.sessionToken, '加入房间后只向本人确认当前有效恢复凭证');
     const roomA2 = await a.c.waitFor(
       (m) => m.type === 'room_update' && m.players.length === 2,
       'room_update（原玩家看到 2 人）',
@@ -313,7 +315,8 @@ async function main() {
     );
 
     c3.c.send({ type: 'join_room', code: '0000', name: '丙' });
-    await expectError(c3.c, '不存在', '加入不存在的房间号被拒绝');
+    const missingRoom = await expectError(c3.c, '不存在', '加入不存在的房间号被拒绝');
+    check(missingRoom.code === 'room_not_found', '不存在的房间带有明确的 room_not_found 错误码');
     c3.c.send({ type: 'join_room', code: roomA.code, name: '丙', resumeToken: 'invalid-resume-token' });
     const invalidResume = await expectError(c3.c, '恢复凭证无效', '错误恢复凭证被拒绝');
     check(invalidResume.code === 'resume_invalid', '错误恢复凭证带有明确的 resume_invalid 错误码');
@@ -367,11 +370,14 @@ async function main() {
     clients.push(aTakeover.c);
     const takeoverState = await aTakeover.c.waitFor((m) => m.type === 'gomoku_state', '接管后的 gomoku_state');
     check(aTakeover.room.resumed === true && aTakeover.room.players.length === 2, '同一恢复凭证接管连接时不新增席位');
+    check(aTakeover.room.resumeToken === stableAToken, '恢复成功后 room_update 再次确认原玩家恢复凭证');
     check(
       takeoverState.moveCount === 1 && takeoverState.board[7 * 15 + 7] === 1 &&
         takeoverState.youColor === gA.youColor,
       '接管后棋盘、落子数和原玩家颜色完全保留',
     );
+    const replaced = await a.c.waitFor((m) => m.type === 'session_replaced', '旧连接被接管通知');
+    check(replaced.code === 'session_replaced', '旧连接收到 session_replaced，不会继续自动抢回会话');
     const peerEventsBeforeOldClose = b.c.messages.filter((m) => m.type === 'peer_left').length;
     a.c.destroy();
     await sleep(200);
