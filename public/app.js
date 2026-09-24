@@ -5,10 +5,13 @@
   // ---------- 工具 ----------
   const $ = (id) => document.getElementById(id);
   const PAGES = ['lobby', 'room', 'gomoku', 'soup'];
+  let visiblePage = null;
 
   function showPage(name) {
+    const changed = visiblePage !== name;
     for (const p of PAGES) $(p).classList.toggle('hidden', p !== name);
-    window.scrollTo(0, 0);
+    visiblePage = name;
+    if (changed) window.scrollTo(0, 0);
   }
 
   let toastTimer = null;
@@ -612,12 +615,63 @@
     return { x, y };
   }
 
+  const BOARD_TAP_SLOP = 8;
+  let boardGesture = null;
+
   canvas.addEventListener('pointerdown', (ev) => {
-    ev.preventDefault();
+    if (ev.isPrimary === false) {
+      if (boardGesture) boardGesture.multi = true;
+      return;
+    }
+    if (ev.pointerType === 'mouse' && ev.button !== 0) return;
+    if (boardGesture) {
+      boardGesture.multi = true;
+      return;
+    }
+    boardGesture = {
+      pointerId: ev.pointerId,
+      pointerType: ev.pointerType,
+      startX: ev.clientX,
+      startY: ev.clientY,
+      moved: false,
+      multi: false,
+    };
+  });
+
+  canvas.addEventListener('pointermove', (ev) => {
+    if (!boardGesture || ev.pointerId !== boardGesture.pointerId) return;
+    const dx = ev.clientX - boardGesture.startX;
+    const dy = ev.clientY - boardGesture.startY;
+    const slop = boardGesture.pointerType === 'mouse' ? 4 : BOARD_TAP_SLOP;
+    if (Math.hypot(dx, dy) > slop) boardGesture.moved = true;
+  });
+
+  canvas.addEventListener('pointerup', (ev) => {
+    if (!boardGesture || ev.pointerId !== boardGesture.pointerId) return;
+    const gesture = boardGesture;
+    boardGesture = null;
+    const dx = ev.clientX - gesture.startX;
+    const dy = ev.clientY - gesture.startY;
+    const slop = gesture.pointerType === 'mouse' ? 4 : BOARD_TAP_SLOP;
+    if (gesture.moved || gesture.multi || ev.isPrimary === false || Math.hypot(dx, dy) > slop) return;
     if (!state.gomoku || state.gomoku.winner || !canUseGameActions()) return;
     const pos = boardPosFromEvent(ev);
     if (!pos) return;
+    ev.preventDefault();
     send({ type: 'gomoku_move', x: pos.x, y: pos.y });
+  });
+
+  canvas.addEventListener('pointercancel', (ev) => {
+    if (boardGesture && ev.pointerId === boardGesture.pointerId) boardGesture = null;
+  });
+
+  // 鼠标按住棋盘拖出后在外部松开时，棋盘不会收到 pointerup；窗口级
+  // 清理避免下一次点击被错误当成多指/残留手势。
+  window.addEventListener('pointerup', (ev) => {
+    if (boardGesture && ev.pointerId === boardGesture.pointerId) boardGesture = null;
+  });
+  window.addEventListener('pointercancel', (ev) => {
+    if (boardGesture && ev.pointerId === boardGesture.pointerId) boardGesture = null;
   });
 
   function renderGomoku() {

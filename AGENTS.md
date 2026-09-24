@@ -155,7 +155,7 @@ game-hub/
 - `connect()` / `scheduleReconnect()`：连接超时、应用层心跳、带随机抖动的指数退避重连，恢复后用 `localStorage` 里的房间号和恢复凭证自动 `join_room`；`online` / `visibilitychange` / `pageshow` 会主动探测。
 - `handleServer(msg)`：唯一的服务端消息入口；`gomoku_state` / `soup_state` 到达时切页并渲染。
 - 大厅：`createBtn` / `joinBtn`（房间号必须是 4 位数字才发请求）。
-- 五子棋：`setupCanvas()` 按 `devicePixelRatio` 适配、`drawBoard()`、`drawStone()`、`boardPosFromEvent()`；点击走 `pointerdown`。
+- 五子棋：`setupCanvas()` 按 `devicePixelRatio` 适配、`drawBoard()`、`drawStone()`、`boardPosFromEvent()`；Pointer Events 用轻点抬起落子，滑动/取消/多指不落子。
 - 海龟汤：`renderSoup()` 按 `isHost` / `phase` 决定显示汤主面板、猜题者面板还是揭晓面板。
 
 ### `test/smoke.js` 内部结构
@@ -238,9 +238,9 @@ node --check server.js && node --check public/app.js && node --check test/smoke.
 ## 7. 移动端要求（改 UI 必须满足）
 
 1. **点击区 ≥ 44×44 CSS px**：`.btn` 已经是 `min-height:46px` + `min-width:44px`，`.btn-small` 是 `min-height:44px`，输入框 `min-height:46px`。新按钮请直接复用 `.btn` 系列 class，不要自己写更小的尺寸；图标按钮必须显式给宽高。
-2. **375px 宽度不能横向滚动**：`html,body` 上的 `overflow-x:hidden` 是**兜底**，不是许可证。新增元素要自己保证不溢出（用 `flex-wrap`、`min-width:0`、`max-width:100%`、`clamp()`）。做法：DevTools 设 375×812，在 console 里跑 `document.documentElement.scrollWidth` 必须 ≤ 375；真机再确认一次。
+2. **375px 宽度不能横向滚动**：`html,body` 上的 `overflow-x:clip;overflow-y:visible` 是**兜底**，不是许可证。新增元素要自己保证不溢出（用 `flex-wrap`、`min-width:0`、`max-width:100%`、`clamp()`）。做法：DevTools 设 375×812，在 console 里跑 `document.documentElement.scrollWidth` 必须 ≤ 375；真机再确认一次。
 3. **必须支持触摸**：
-   - 棋盘用 `pointerdown`（同时覆盖鼠标 / 触摸 / 触控笔），不要改成只监听 `mousedown` 或依赖 `hover`。canvas 上的 `touch-action:none` 是防止落子时页面跟着滚动的，不能删。
+   - 棋盘用 Pointer Events 同时覆盖鼠标 / 触摸 / 触控笔：允许 `pan-y pinch-zoom` 原生纵向滚动；只有未超过移动阈值的单指轻点在 `pointerup` 落子，滑动、取消和多指都不能落子。不要改成只监听 `mousedown` 或依赖 `hover`。
    - 可点元素保留 `touch-action:manipulation`（消除移动端 300ms 点击延迟）。
    - 输入框 `font-size` 不要小于 16px，否则 iOS Safari 会自动放大页面。
    - 不要用 hover 作为唯一的交互反馈。
